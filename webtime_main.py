@@ -1,23 +1,22 @@
 # ============================================================
 # Webtime Keyword Extractor UI
 #
-# Version : v1.4.1
+# Version : v1.5.0
 # Last Updated : 2025-12-24
 #
 # [주요 목적]
 # - Web page loading 관련 로그(logcat_*_main.txt)에서
-#   LOADING_STARTED / onPageStarted() /
-#   onReceive(): action = LOADED 및 ISSUE 포인트를 자동 추출
+#   로딩 시작/완료 구간을 블록으로 분리하고,
+#   키워드 매칭 라인을 ALL/ISSUE로 출력
+#
+# [Release Notes] v1.5.0
+# - (FEATURE) 로딩 블록 시작/완료 키워드: Preset 선택 + Custom 입력 지원
+# - (FEATURE) ISSUE 전용 키워드 리스트: 다중 추가/삭제 지원
+# - (FEATURE) ISSUE 출력에 ISSUE 전용 키워드 포함 여부 선택(Include/Exclude/Ignore)
 #
 # [Release Notes] v1.4.1
 # - (FIX) ISSUE 출력에서 PERCENTAGE_UPDATED 라인이 중복 출력되던 문제 제거
 # - (REFAC) ISSUE 추출 로직 단순화(한 경로에서만 키워드 매칭)
-#
-# [Release Notes] v1.4.0
-# - 출력 경로 표시 방식(Tree/Indent) 선택 + ui_state.json에 저장/복원
-# - Output 폴더 사용자 지정 기능 추가(기본: Root)
-# - 로그 Clear 버튼 추가(실행 중 비활성화)
-# - 진행률 로그([PROGRESS] n/total) 유지
 # ============================================================
 
 import os
@@ -57,15 +56,18 @@ def save_state(state: dict) -> None:
 
 
 # =========================
-# Config / Keywords
+# Defaults / Presets
 # =========================
-KW_LOADING = "LOADING_STARTED"
-KW_ONPAGE = "onPageStarted()"
-KW_LOADED = "onReceive(): action = LOADED"
-KW_PCT = "PERCENTAGE_UPDATED"  # ISSUE-only
+DEFAULT_START = "LOADING_STARTED"
+DEFAULT_END = "onReceive(): action = LOADED"
+DEFAULT_ONPAGE = "onPageStarted()"
 
-ALL_KEYWORDS = [KW_LOADING, KW_ONPAGE, KW_LOADED]
-ISSUE_ONLY_KEYWORDS = [KW_PCT]
+START_PRESETS = [
+    DEFAULT_START,
+]
+END_PRESETS = [
+    DEFAULT_END,
+]
 
 LOGCAT_GLOB = "logcat_*_main.txt"
 
@@ -149,17 +151,17 @@ def find_logcat_files(section_dir: Path) -> list[Path]:
 # =========================
 # Parsing / block logic
 # =========================
-def extract_blocks(lines: list[str]) -> list[list[str]]:
+def extract_blocks(lines: list[str], start_kw: str) -> list[list[str]]:
     """
-    Split blocks by LOADING_STARTED.
-    - Preserves blocks with only LOADING_STARTED.
-    - Ignores preamble before first LOADING_STARTED.
+    Split blocks by start_kw.
+    - Preserves blocks with only start_kw line.
+    - Ignores preamble before first start_kw.
     """
     blocks = []
     cur = None
     for raw in lines:
         line = raw.rstrip("\n")
-        if KW_LOADING in line:
+        if start_kw and (start_kw in line):
             if cur is not None:
                 blocks.append(cur)
             cur = [line]
@@ -172,41 +174,74 @@ def extract_blocks(lines: list[str]) -> list[list[str]]:
     return blocks
 
 
-def block_contains_loaded(block: list[str]) -> bool:
-    return any(KW_LOADED in ln for ln in block)
+def block_contains_end(block: list[str], end_kw: str) -> bool:
+    if not end_kw:
+        return False
+    return any(end_kw in ln for ln in block)
 
 
-def block_extract_matches(block: list[str], keywords: list[str], issue_only: bool) -> list[str]:
+def block_extract_matches(
+    block: list[str],
+    all_keywords: list[str],
+    start_kw: str,
+    end_kw: str,
+    issue_only_keywords: list[str],
+    issue_mode: str,
+) -> list[str]:
     """
     Formatting rules:
-    - blank line BEFORE LOADING_STARTED
-    - blank line AFTER LOADED line
+    - blank line BEFORE start_kw line
+    - blank line AFTER end_kw line
     - output raw matched lines only (no extra prefixes)
 
-    NOTE:
-    - issue_only=True 일 때는 ISSUE_ONLY_KEYWORDS(KW_PCT 등)도 포함하여 매칭.
+    issue_mode:
+      - "Include": include issue_only_keywords in matching
+      - "Exclude": do not output issue_only_keywords lines (even if matched by all_keywords)
+      - "Ignore" : do not consider issue_only_keywords at all
     """
+    issue_only_keywords = [k for k in (issue_only_keywords or []) if k.strip()]
+    issue_mode = (issue_mode or "Include").strip()
+
+    def is_issue_only_line(ln: str) -> bool:
+        return any(k in ln for k in issue_only_keywords) if issue_only_keywords else False
+
     out = []
     for ln in block:
-        matched = any(k in ln for k in keywords)
-        if issue_only:
-            matched = matched or any(k in ln for k in ISSUE_ONLY_KEYWORDS)
+        matched_all = any(k and (k in ln) for k in all_keywords)
+
+        matched_issue_extra = False
+        if issue_mode == "Include":
+            matched_issue_extra = is_issue_only_line(ln)
+
+        matched = matched_all or matched_issue_extra
 
         if not matched:
             continue
 
-        if KW_LOADING in ln:
+        # If Exclude: drop issue-only lines from output
+        if issue_mode == "Exclude" and is_issue_only_line(ln):
+            continue
+
+        if start_kw and (start_kw in ln):
             out.append("")  # mandatory blank line
             out.append(ln)
-        elif KW_LOADED in ln:
+        elif end_kw and (end_kw in ln):
             out.append(ln)
             out.append("")  # mandatory blank line
         else:
             out.append(ln)
+
     return [x.rstrip("\n") for x in out]
 
 
-def process_logcat_file(fp: Path):
+def process_logcat_file(
+    fp: Path,
+    start_kw: str,
+    end_kw: str,
+    include_onpage: bool,
+    issue_only_keywords: list[str],
+    issue_mode: str,
+):
     """
     Return:
       all_out_blocks: list[block_lines]
@@ -217,20 +252,43 @@ def process_logcat_file(fp: Path):
     except Exception:
         return [], []
 
-    blocks = extract_blocks(text)
+    blocks = extract_blocks(text, start_kw=start_kw)
+
+    # ALL keywords 구성
+    all_keywords = []
+    if start_kw:
+        all_keywords.append(start_kw)
+    if include_onpage and DEFAULT_ONPAGE:
+        all_keywords.append(DEFAULT_ONPAGE)
+    if end_kw:
+        all_keywords.append(end_kw)
+
     all_out_blocks = []
     issue_out_blocks = []
 
     for b in blocks:
         # ALL
-        all_matches = block_extract_matches(b, ALL_KEYWORDS, issue_only=False)
+        all_matches = block_extract_matches(
+            b,
+            all_keywords=all_keywords,
+            start_kw=start_kw,
+            end_kw=end_kw,
+            issue_only_keywords=[],   # ALL에는 issue-only를 넣지 않음(혼선 방지)
+            issue_mode="Ignore",
+        )
         if all_matches:
             all_out_blocks.append(all_matches)
 
-        # ISSUE definition: blocks where LOADED is missing
-        if not block_contains_loaded(b):
-            # v1.4.1 FIX: PERCENTAGE_UPDATED는 block_extract_matches(issue_only=True)에서만 처리
-            issue_matches = block_extract_matches(b, ALL_KEYWORDS, issue_only=True)
+        # ISSUE definition: blocks where END is missing
+        if not block_contains_end(b, end_kw=end_kw):
+            issue_matches = block_extract_matches(
+                b,
+                all_keywords=all_keywords,
+                start_kw=start_kw,
+                end_kw=end_kw,
+                issue_only_keywords=issue_only_keywords,
+                issue_mode=issue_mode,  # Include/Exclude/Ignore
+            )
             if issue_matches:
                 issue_out_blocks.append(issue_matches)
 
@@ -246,6 +304,7 @@ def write_outputs(
     path_lines_main: list[str],
     path_lines_ap: list[str],
     results: list[dict],
+    cfg_summary_lines: list[str],
 ):
     """
     results item:
@@ -258,6 +317,11 @@ def write_outputs(
     """
 
     def write_header(f):
+        f.write("========== CONFIG ==========\n")
+        for ln in cfg_summary_lines:
+            f.write(ln + "\n")
+        f.write("\n")
+
         f.write("========== PATH (log_events -> [AP] -> ap_silentlog -> section -> logcat_*_main.txt) ==========\n")
         for ln in path_lines_main:
             f.write(ln + "\n")
@@ -312,7 +376,7 @@ class WebtimeApp(tk.Tk):
         super().__init__()
         self.state_data = load_state()
         self.title("Webtime Keyword Extractor (UI)")
-        self.geometry(self.state_data.get("geometry", "980x660"))
+        self.geometry(self.state_data.get("geometry", "1020x740"))
 
         self.root_path_var = tk.StringVar(value=self.state_data.get("root_path", ""))
         self.open_folder_var = tk.BooleanVar(value=self.state_data.get("open_folder", True))
@@ -323,9 +387,49 @@ class WebtimeApp(tk.Tk):
         # Tree/Indent
         self.path_format_var = tk.StringVar(value=self.state_data.get("path_format", "Tree"))
 
+        # Start/End keyword: preset + custom
+        self.start_mode_var = tk.StringVar(value=self.state_data.get("start_mode", "Preset"))  # Preset/Custom
+        self.end_mode_var = tk.StringVar(value=self.state_data.get("end_mode", "Preset"))      # Preset/Custom
+        self.start_preset_var = tk.StringVar(value=self.state_data.get("start_preset", DEFAULT_START))
+        self.end_preset_var = tk.StringVar(value=self.state_data.get("end_preset", DEFAULT_END))
+        self.start_custom_var = tk.StringVar(value=self.state_data.get("start_custom", DEFAULT_START))
+        self.end_custom_var = tk.StringVar(value=self.state_data.get("end_custom", DEFAULT_END))
+
+        # include onPageStarted in ALL extraction
+        self.include_onpage_var = tk.BooleanVar(value=self.state_data.get("include_onpage", True))
+
+        # Issue-only keywords list (dynamic)
+        saved_issue_kws = self.state_data.get("issue_only_keywords", ["PERCENTAGE_UPDATED"])
+        if not isinstance(saved_issue_kws, list) or not saved_issue_kws:
+            saved_issue_kws = ["PERCENTAGE_UPDATED"]
+        self.issue_kw_vars: list[tk.StringVar] = [tk.StringVar(value=str(x)) for x in saved_issue_kws]
+
+        # Issue mode: Include / Exclude / Ignore
+        self.issue_mode_var = tk.StringVar(value=self.state_data.get("issue_mode", "Include"))
+
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
+    # ---------- keyword helpers ----------
+    def _get_start_kw(self) -> str:
+        if self.start_mode_var.get() == "Custom":
+            return self.start_custom_var.get().strip()
+        return self.start_preset_var.get().strip()
+
+    def _get_end_kw(self) -> str:
+        if self.end_mode_var.get() == "Custom":
+            return self.end_custom_var.get().strip()
+        return self.end_preset_var.get().strip()
+
+    def _get_issue_only_keywords(self) -> list[str]:
+        kws = []
+        for v in self.issue_kw_vars:
+            s = v.get().strip()
+            if s:
+                kws.append(s)
+        return kws
+
+    # ---------- UI ----------
     def _build_ui(self):
         pad = 10
         frm = ttk.Frame(self, padding=pad)
@@ -366,9 +470,76 @@ class WebtimeApp(tk.Tk):
         self.fmt_cb.pack(side=tk.LEFT, padx=(8, 0))
         self.fmt_cb.bind("<<ComboboxSelected>>", lambda _e: self._persist_light())
 
+        # Keywords frame
+        kwf = ttk.LabelFrame(frm, text="Keywords", padding=10)
+        kwf.pack(fill=tk.X, pady=(12, 0))
+
+        # Start keyword
+        srow = ttk.Frame(kwf)
+        srow.pack(fill=tk.X)
+        ttk.Label(srow, text="Block Start").pack(side=tk.LEFT)
+
+        ttk.Radiobutton(srow, text="Preset", variable=self.start_mode_var, value="Preset",
+                        command=self._sync_keyword_controls).pack(side=tk.LEFT, padx=(10, 0))
+        self.start_preset_cb = ttk.Combobox(srow, textvariable=self.start_preset_var, state="readonly", width=34)
+        self.start_preset_cb["values"] = START_PRESETS
+        self.start_preset_cb.pack(side=tk.LEFT, padx=(6, 0))
+        self.start_preset_cb.bind("<<ComboboxSelected>>", lambda _e: self._persist_light())
+
+        ttk.Radiobutton(srow, text="Custom", variable=self.start_mode_var, value="Custom",
+                        command=self._sync_keyword_controls).pack(side=tk.LEFT, padx=(12, 0))
+        self.start_custom_ent = ttk.Entry(srow, textvariable=self.start_custom_var, width=38)
+        self.start_custom_ent.pack(side=tk.LEFT, padx=(6, 0))
+
+        # End keyword
+        erow = ttk.Frame(kwf)
+        erow.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(erow, text="Block End").pack(side=tk.LEFT)
+
+        ttk.Radiobutton(erow, text="Preset", variable=self.end_mode_var, value="Preset",
+                        command=self._sync_keyword_controls).pack(side=tk.LEFT, padx=(22, 0))
+        self.end_preset_cb = ttk.Combobox(erow, textvariable=self.end_preset_var, state="readonly", width=34)
+        self.end_preset_cb["values"] = END_PRESETS
+        self.end_preset_cb.pack(side=tk.LEFT, padx=(6, 0))
+        self.end_preset_cb.bind("<<ComboboxSelected>>", lambda _e: self._persist_light())
+
+        ttk.Radiobutton(erow, text="Custom", variable=self.end_mode_var, value="Custom",
+                        command=self._sync_keyword_controls).pack(side=tk.LEFT, padx=(12, 0))
+        self.end_custom_ent = ttk.Entry(erow, textvariable=self.end_custom_var, width=38)
+        self.end_custom_ent.pack(side=tk.LEFT, padx=(6, 0))
+
+        # include onPage
+        orow = ttk.Frame(kwf)
+        orow.pack(fill=tk.X, pady=(8, 0))
+        ttk.Checkbutton(orow, text=f'Include "{DEFAULT_ONPAGE}" in ALL output',
+                        variable=self.include_onpage_var, command=self._persist_light).pack(side=tk.LEFT)
+
+        # Issue keywords + mode
+        isf = ttk.LabelFrame(frm, text="ISSUE Output", padding=10)
+        isf.pack(fill=tk.X, pady=(12, 0))
+
+        mode_row = ttk.Frame(isf)
+        mode_row.pack(fill=tk.X)
+        ttk.Label(mode_row, text="Issue-only keywords handling").pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_row, text="Include", variable=self.issue_mode_var, value="Include",
+                        command=self._persist_light).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Radiobutton(mode_row, text="Exclude", variable=self.issue_mode_var, value="Exclude",
+                        command=self._persist_light).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Radiobutton(mode_row, text="Ignore", variable=self.issue_mode_var, value="Ignore",
+                        command=self._persist_light).pack(side=tk.LEFT, padx=(8, 0))
+
+        ttk.Label(isf, text="Issue-only keywords list").pack(anchor="w", pady=(8, 2))
+        self.issue_list_frame = ttk.Frame(isf)
+        self.issue_list_frame.pack(fill=tk.X)
+        self._render_issue_kw_rows()
+
+        add_row = ttk.Frame(isf)
+        add_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(add_row, text="+ Add keyword", command=self._add_issue_kw).pack(side=tk.LEFT)
+
         # Options
         opt = ttk.Frame(frm)
-        opt.pack(fill=tk.X, pady=(10, 0))
+        opt.pack(fill=tk.X, pady=(12, 0))
         ttk.Checkbutton(opt, text="Open output folder when done", variable=self.open_folder_var).pack(side=tk.LEFT)
 
         # Run row + clear log
@@ -383,7 +554,7 @@ class WebtimeApp(tk.Tk):
 
         # Log
         ttk.Label(frm, text="Log").pack(anchor="w", pady=(12, 4))
-        self.log = tk.Text(frm, height=24, wrap="word")
+        self.log = tk.Text(frm, height=18, wrap="word")
         self.log.pack(fill=tk.BOTH, expand=True)
         self.log.configure(state="disabled")
 
@@ -392,6 +563,38 @@ class WebtimeApp(tk.Tk):
         self.out_label.pack(anchor="w", pady=(10, 0))
 
         self._sync_output_controls()
+        self._sync_keyword_controls()
+
+    def _render_issue_kw_rows(self):
+        for w in self.issue_list_frame.winfo_children():
+            w.destroy()
+
+        for i, var in enumerate(self.issue_kw_vars):
+            r = ttk.Frame(self.issue_list_frame)
+            r.pack(fill=tk.X, pady=2)
+
+            ttk.Label(r, text=f"{i+1}.").pack(side=tk.LEFT)
+            ent = ttk.Entry(r, textvariable=var)
+            ent.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
+            ent.bind("<KeyRelease>", lambda _e: self._persist_light())
+
+            ttk.Button(r, text="Remove", command=lambda idx=i: self._remove_issue_kw(idx)).pack(side=tk.LEFT)
+
+    def _add_issue_kw(self):
+        self.issue_kw_vars.append(tk.StringVar(value=""))
+        self._render_issue_kw_rows()
+        self._persist_light()
+
+    def _remove_issue_kw(self, idx: int):
+        if len(self.issue_kw_vars) <= 1:
+            messagebox.showinfo("Info", "At least one keyword must remain.")
+            return
+        try:
+            self.issue_kw_vars.pop(idx)
+        except Exception:
+            return
+        self._render_issue_kw_rows()
+        self._persist_light()
 
     def _collect_state(self) -> dict:
         return {
@@ -401,6 +604,17 @@ class WebtimeApp(tk.Tk):
             "use_custom_out": bool(self.use_custom_out_var.get()),
             "out_path": self.out_path_var.get(),
             "path_format": self.path_format_var.get(),
+
+            "start_mode": self.start_mode_var.get(),
+            "end_mode": self.end_mode_var.get(),
+            "start_preset": self.start_preset_var.get(),
+            "end_preset": self.end_preset_var.get(),
+            "start_custom": self.start_custom_var.get(),
+            "end_custom": self.end_custom_var.get(),
+            "include_onpage": bool(self.include_onpage_var.get()),
+
+            "issue_only_keywords": self._get_issue_only_keywords(),
+            "issue_mode": self.issue_mode_var.get(),
         }
 
     def _persist_light(self):
@@ -411,6 +625,19 @@ class WebtimeApp(tk.Tk):
         state = "normal" if use_custom else "disabled"
         self.out_ent.configure(state=state)
         self.out_btn.configure(state=state)
+        self._persist_light()
+
+    def _sync_keyword_controls(self):
+        s_mode = self.start_mode_var.get()
+        e_mode = self.end_mode_var.get()
+
+        self.start_preset_cb.configure(state="readonly" if s_mode == "Preset" else "disabled")
+        self.start_custom_ent.configure(state="normal" if s_mode == "Custom" else "disabled")
+
+        self.end_preset_cb.configure(state="readonly" if e_mode == "Preset" else "disabled")
+        self.end_custom_ent.configure(state="normal" if e_mode == "Custom" else "disabled")
+
+        self._persist_light()
 
     def log_write(self, msg: str):
         self.log.configure(state="normal")
@@ -441,6 +668,17 @@ class WebtimeApp(tk.Tk):
         self.root_ent.configure(state="disabled" if running else "normal")
         self.fmt_cb.configure(state="disabled" if running else "readonly")
 
+        # keyword controls lock
+        widgets = [
+            self.start_preset_cb, self.start_custom_ent,
+            self.end_preset_cb, self.end_custom_ent,
+        ]
+        for w in widgets:
+            try:
+                w.configure(state="disabled" if running else w.cget("state"))
+            except Exception:
+                pass
+
         if running:
             self.out_ent.configure(state="disabled")
             self.out_btn.configure(state="disabled")
@@ -448,6 +686,7 @@ class WebtimeApp(tk.Tk):
         else:
             self.prog.stop()
             self._sync_output_controls()
+            self._sync_keyword_controls()
 
     def on_run(self):
         root_str = self.root_path_var.get().strip()
@@ -472,6 +711,15 @@ class WebtimeApp(tk.Tk):
         else:
             out_dir = root
 
+        start_kw = self._get_start_kw()
+        end_kw = self._get_end_kw()
+        if not start_kw:
+            messagebox.showwarning("Warning", "Block Start keyword cannot be empty.")
+            return
+        if not end_kw:
+            messagebox.showwarning("Warning", "Block End keyword cannot be empty.")
+            return
+
         self._persist_light()
         self._set_running(True)
 
@@ -479,17 +727,31 @@ class WebtimeApp(tk.Tk):
         self.log_write(f"Root   : {root}")
         self.log_write(f"Output : {out_dir}")
         self.log_write(f"PathFmt: {self.path_format_var.get()}")
+        self.log_write(f"StartKW: {start_kw}")
+        self.log_write(f"EndKW  : {end_kw}")
+        self.log_write(f"OnPage : {self.include_onpage_var.get()} ({DEFAULT_ONPAGE})")
+        self.log_write(f"IssueMode: {self.issue_mode_var.get()}")
+        self.log_write(f"IssueOnly: {self._get_issue_only_keywords()}")
 
         th = threading.Thread(
             target=self._worker,
-            args=(root, out_dir, self.path_format_var.get()),
+            args=(root, out_dir, self.path_format_var.get(), start_kw, end_kw,
+                  bool(self.include_onpage_var.get()),
+                  self._get_issue_only_keywords(),
+                  self.issue_mode_var.get()),
             daemon=True
         )
         th.start()
 
-    def _worker(self, root: Path, out_dir: Path, path_format: str):
+    def _worker(self, root: Path, out_dir: Path, path_format: str,
+                start_kw: str, end_kw: str, include_onpage: bool,
+                issue_only_keywords: list[str], issue_mode: str):
         try:
-            out_all, out_issue = self.run_job(root, out_dir, path_format)
+            out_all, out_issue = self.run_job(
+                root, out_dir, path_format,
+                start_kw, end_kw, include_onpage,
+                issue_only_keywords, issue_mode
+            )
             self.after(0, lambda: self._done_ok(out_all, out_issue))
         except Exception as e:
             self.after(0, lambda: self._done_err(e))
@@ -516,7 +778,9 @@ class WebtimeApp(tk.Tk):
         self.log_write(f"[ERROR] {e}")
         messagebox.showerror("Error", str(e))
 
-    def run_job(self, root: Path, out_dir: Path, path_format: str) -> tuple[Path, Path]:
+    def run_job(self, root: Path, out_dir: Path, path_format: str,
+                start_kw: str, end_kw: str, include_onpage: bool,
+                issue_only_keywords: list[str], issue_mode: str) -> tuple[Path, Path]:
         ts = time.strftime("%Y%m%d_%H%M%S")
         out_all = out_dir / f"webtime_ALL_{ts}.txt"
         out_issue = out_dir / f"webtime_ISSUE_{ts}.txt"
@@ -583,7 +847,14 @@ class WebtimeApp(tk.Tk):
         results = []
         done = 0
         for sec, lf in work_items:
-            all_blocks, issue_blocks = process_logcat_file(lf)
+            all_blocks, issue_blocks = process_logcat_file(
+                lf,
+                start_kw=start_kw,
+                end_kw=end_kw,
+                include_onpage=include_onpage,
+                issue_only_keywords=issue_only_keywords,
+                issue_mode=issue_mode,
+            )
             results.append({
                 "section": sec,
                 "file": lf,
@@ -602,7 +873,15 @@ class WebtimeApp(tk.Tk):
             path_lines_main = _render_tree_ascii(tree_main)
             path_lines_ap = _render_tree_ascii(tree_ap)
 
-        write_outputs(out_all, out_issue, path_lines_main, path_lines_ap, results)
+        cfg_summary_lines = [
+            f"Block Start Keyword: {start_kw}",
+            f"Block End Keyword  : {end_kw}",
+            f'Include onPageStarted: {include_onpage} ({DEFAULT_ONPAGE})',
+            f"Issue-only mode: {issue_mode} (Include/Exclude/Ignore)",
+            f"Issue-only keywords: {issue_only_keywords}",
+        ]
+
+        write_outputs(out_all, out_issue, path_lines_main, path_lines_ap, results, cfg_summary_lines)
 
         self.log_write(f"[OUTPUT] {out_all}")
         self.log_write(f"[OUTPUT] {out_issue}")
