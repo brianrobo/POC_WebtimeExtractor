@@ -1,13 +1,19 @@
 # ============================================================
 # Webtime Keyword Extractor UI
 #
-# Version : v1.5.0
-# Last Updated : 2025-12-24
+# Version : v1.5.1
+# Last Updated : 2025-12-27
 #
 # [주요 목적]
 # - Web page loading 관련 로그(logcat_*_main.txt)에서
 #   로딩 시작/완료 구간을 블록으로 분리하고,
 #   키워드 매칭 라인을 ALL/ISSUE로 출력
+#
+# [Release Notes] v1.5.1
+# - (FIX) Run 후 UI 컨트롤이 disabled 상태로 남을 수 있는 문제 수정(_set_running 복구 로직 정정)
+# - (UX) Window title에 Version/Last Updated 표기 추가
+# - (UX) Start/End Custom 입력값도 키 입력 즉시 UI state 저장하도록 개선
+# - (UX) 키워드 매칭 결과가 0인 경우 완료 시 알림 팝업으로 안내 (Start/End 불일치 등 빠른 인지)
 #
 # [Release Notes] v1.5.0
 # - (FEATURE) 로딩 블록 시작/완료 키워드: Preset 선택 + Custom 입력 지원
@@ -27,6 +33,9 @@ import threading
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+APP_VERSION = "v1.5.1"
+LAST_UPDATED = "2025-12-27"
 
 # =========================
 # UI state
@@ -267,13 +276,13 @@ def process_logcat_file(
     issue_out_blocks = []
 
     for b in blocks:
-        # ALL
+        # ALL (issue-only는 ALL에 넣지 않음)
         all_matches = block_extract_matches(
             b,
             all_keywords=all_keywords,
             start_kw=start_kw,
             end_kw=end_kw,
-            issue_only_keywords=[],   # ALL에는 issue-only를 넣지 않음(혼선 방지)
+            issue_only_keywords=[],
             issue_mode="Ignore",
         )
         if all_matches:
@@ -375,7 +384,9 @@ class WebtimeApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.state_data = load_state()
-        self.title("Webtime Keyword Extractor (UI)")
+
+        # Version 표기
+        self.title(f"Webtime Keyword Extractor (UI) {APP_VERSION} ({LAST_UPDATED})")
         self.geometry(self.state_data.get("geometry", "1020x740"))
 
         self.root_path_var = tk.StringVar(value=self.state_data.get("root_path", ""))
@@ -406,6 +417,9 @@ class WebtimeApp(tk.Tk):
 
         # Issue mode: Include / Exclude / Ignore
         self.issue_mode_var = tk.StringVar(value=self.state_data.get("issue_mode", "Include"))
+
+        # For v1.5.1 UX: matching summary
+        self._last_match_summary = None  # (total_all_blocks, total_issue_blocks)
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -479,40 +493,58 @@ class WebtimeApp(tk.Tk):
         srow.pack(fill=tk.X)
         ttk.Label(srow, text="Block Start").pack(side=tk.LEFT)
 
-        ttk.Radiobutton(srow, text="Preset", variable=self.start_mode_var, value="Preset",
-                        command=self._sync_keyword_controls).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Radiobutton(
+            srow, text="Preset", variable=self.start_mode_var, value="Preset",
+            command=self._sync_keyword_controls
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
         self.start_preset_cb = ttk.Combobox(srow, textvariable=self.start_preset_var, state="readonly", width=34)
         self.start_preset_cb["values"] = START_PRESETS
         self.start_preset_cb.pack(side=tk.LEFT, padx=(6, 0))
         self.start_preset_cb.bind("<<ComboboxSelected>>", lambda _e: self._persist_light())
 
-        ttk.Radiobutton(srow, text="Custom", variable=self.start_mode_var, value="Custom",
-                        command=self._sync_keyword_controls).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Radiobutton(
+            srow, text="Custom", variable=self.start_mode_var, value="Custom",
+            command=self._sync_keyword_controls
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
         self.start_custom_ent = ttk.Entry(srow, textvariable=self.start_custom_var, width=38)
         self.start_custom_ent.pack(side=tk.LEFT, padx=(6, 0))
+        # v1.5.1: custom도 즉시 상태 저장
+        self.start_custom_ent.bind("<KeyRelease>", lambda _e: self._persist_light())
 
         # End keyword
         erow = ttk.Frame(kwf)
         erow.pack(fill=tk.X, pady=(8, 0))
         ttk.Label(erow, text="Block End").pack(side=tk.LEFT)
 
-        ttk.Radiobutton(erow, text="Preset", variable=self.end_mode_var, value="Preset",
-                        command=self._sync_keyword_controls).pack(side=tk.LEFT, padx=(22, 0))
+        ttk.Radiobutton(
+            erow, text="Preset", variable=self.end_mode_var, value="Preset",
+            command=self._sync_keyword_controls
+        ).pack(side=tk.LEFT, padx=(22, 0))
+
         self.end_preset_cb = ttk.Combobox(erow, textvariable=self.end_preset_var, state="readonly", width=34)
         self.end_preset_cb["values"] = END_PRESETS
         self.end_preset_cb.pack(side=tk.LEFT, padx=(6, 0))
         self.end_preset_cb.bind("<<ComboboxSelected>>", lambda _e: self._persist_light())
 
-        ttk.Radiobutton(erow, text="Custom", variable=self.end_mode_var, value="Custom",
-                        command=self._sync_keyword_controls).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Radiobutton(
+            erow, text="Custom", variable=self.end_mode_var, value="Custom",
+            command=self._sync_keyword_controls
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
         self.end_custom_ent = ttk.Entry(erow, textvariable=self.end_custom_var, width=38)
         self.end_custom_ent.pack(side=tk.LEFT, padx=(6, 0))
+        # v1.5.1: custom도 즉시 상태 저장
+        self.end_custom_ent.bind("<KeyRelease>", lambda _e: self._persist_light())
 
         # include onPage
         orow = ttk.Frame(kwf)
         orow.pack(fill=tk.X, pady=(8, 0))
-        ttk.Checkbutton(orow, text=f'Include "{DEFAULT_ONPAGE}" in ALL output',
-                        variable=self.include_onpage_var, command=self._persist_light).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            orow, text=f'Include "{DEFAULT_ONPAGE}" in ALL output',
+            variable=self.include_onpage_var, command=self._persist_light
+        ).pack(side=tk.LEFT)
 
         # Issue keywords + mode
         isf = ttk.LabelFrame(frm, text="ISSUE Output", padding=10)
@@ -521,12 +553,18 @@ class WebtimeApp(tk.Tk):
         mode_row = ttk.Frame(isf)
         mode_row.pack(fill=tk.X)
         ttk.Label(mode_row, text="Issue-only keywords handling").pack(side=tk.LEFT)
-        ttk.Radiobutton(mode_row, text="Include", variable=self.issue_mode_var, value="Include",
-                        command=self._persist_light).pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Radiobutton(mode_row, text="Exclude", variable=self.issue_mode_var, value="Exclude",
-                        command=self._persist_light).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Radiobutton(mode_row, text="Ignore", variable=self.issue_mode_var, value="Ignore",
-                        command=self._persist_light).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Radiobutton(
+            mode_row, text="Include", variable=self.issue_mode_var, value="Include",
+            command=self._persist_light
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Radiobutton(
+            mode_row, text="Exclude", variable=self.issue_mode_var, value="Exclude",
+            command=self._persist_light
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Radiobutton(
+            mode_row, text="Ignore", variable=self.issue_mode_var, value="Ignore",
+            command=self._persist_light
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         ttk.Label(isf, text="Issue-only keywords list").pack(anchor="w", pady=(8, 2))
         self.issue_list_frame = ttk.Frame(isf)
@@ -662,20 +700,20 @@ class WebtimeApp(tk.Tk):
             self.out_path_var.set(p)
             self._persist_light()
 
+    # v1.5.1 FIX: running 종료 시 상태 복구 로직을 _sync_*에 위임
     def _set_running(self, running: bool):
         self.run_btn.configure(state="disabled" if running else "normal")
         self.clear_btn.configure(state="disabled" if running else "normal")
         self.root_ent.configure(state="disabled" if running else "normal")
         self.fmt_cb.configure(state="disabled" if running else "readonly")
 
-        # keyword controls lock
         widgets = [
             self.start_preset_cb, self.start_custom_ent,
             self.end_preset_cb, self.end_custom_ent,
         ]
         for w in widgets:
             try:
-                w.configure(state="disabled" if running else w.cget("state"))
+                w.configure(state="disabled" if running else "normal")
             except Exception:
                 pass
 
@@ -747,11 +785,12 @@ class WebtimeApp(tk.Tk):
                 start_kw: str, end_kw: str, include_onpage: bool,
                 issue_only_keywords: list[str], issue_mode: str):
         try:
-            out_all, out_issue = self.run_job(
+            out_all, out_issue, match_summary = self.run_job(
                 root, out_dir, path_format,
                 start_kw, end_kw, include_onpage,
                 issue_only_keywords, issue_mode
             )
+            self._last_match_summary = match_summary
             self.after(0, lambda: self._done_ok(out_all, out_issue))
         except Exception as e:
             self.after(0, lambda: self._done_err(e))
@@ -760,6 +799,21 @@ class WebtimeApp(tk.Tk):
         self._set_running(False)
         self.out_label.configure(text=f"Output:\n- {out_all}\n- {out_issue}")
         self.log_write("== Done ==")
+
+        # v1.5.1 UX: 매칭 0이면 알림
+        try:
+            total_all, total_issue = self._last_match_summary or (None, None)
+            if total_all == 0 and total_issue == 0:
+                messagebox.showinfo(
+                    "No matches",
+                    "No keyword matches were found in the discovered logcat files.\n\n"
+                    "Please verify:\n"
+                    "- Block Start/End keywords are correct\n"
+                    "- Selected root contains expected log_events/ap_silentlog structure\n"
+                    "- The logcat files are the intended ones"
+                )
+        except Exception:
+            pass
 
         if self.open_folder_var.get():
             try:
@@ -780,7 +834,7 @@ class WebtimeApp(tk.Tk):
 
     def run_job(self, root: Path, out_dir: Path, path_format: str,
                 start_kw: str, end_kw: str, include_onpage: bool,
-                issue_only_keywords: list[str], issue_mode: str) -> tuple[Path, Path]:
+                issue_only_keywords: list[str], issue_mode: str):
         ts = time.strftime("%Y%m%d_%H%M%S")
         out_all = out_dir / f"webtime_ALL_{ts}.txt"
         out_issue = out_dir / f"webtime_ISSUE_{ts}.txt"
@@ -846,6 +900,11 @@ class WebtimeApp(tk.Tk):
 
         results = []
         done = 0
+
+        # v1.5.1: match summary counts
+        total_all_blocks = 0
+        total_issue_blocks = 0
+
         for sec, lf in work_items:
             all_blocks, issue_blocks = process_logcat_file(
                 lf,
@@ -855,6 +914,10 @@ class WebtimeApp(tk.Tk):
                 issue_only_keywords=issue_only_keywords,
                 issue_mode=issue_mode,
             )
+
+            total_all_blocks += len(all_blocks)
+            total_issue_blocks += len(issue_blocks)
+
             results.append({
                 "section": sec,
                 "file": lf,
@@ -874,6 +937,7 @@ class WebtimeApp(tk.Tk):
             path_lines_ap = _render_tree_ascii(tree_ap)
 
         cfg_summary_lines = [
+            f"App Version        : {APP_VERSION} ({LAST_UPDATED})",
             f"Block Start Keyword: {start_kw}",
             f"Block End Keyword  : {end_kw}",
             f'Include onPageStarted: {include_onpage} ({DEFAULT_ONPAGE})',
@@ -885,8 +949,9 @@ class WebtimeApp(tk.Tk):
 
         self.log_write(f"[OUTPUT] {out_all}")
         self.log_write(f"[OUTPUT] {out_issue}")
+        self.log_write(f"[SUMMARY] total_all_blocks={total_all_blocks}, total_issue_blocks={total_issue_blocks}")
 
-        return out_all, out_issue
+        return out_all, out_issue, (total_all_blocks, total_issue_blocks)
 
     def on_close(self):
         save_state(self._collect_state())
