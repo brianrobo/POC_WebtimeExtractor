@@ -1,13 +1,19 @@
 # ============================================================
 # Webtime Keyword Extractor UI
 #
-# Version : v1.5.2
+# Version : v1.5.3
 # Last Updated : 2025-12-27
 #
 # [주요 목적]
 # - Web page loading 관련 로그(logcat_*_main.txt)에서
 #   로딩 시작/완료 구간을 블록으로 분리하고,
 #   키워드 매칭 라인을 ALL/ISSUE로 출력
+#
+# [Release Notes] v1.5.3
+# - (FEATURE) ISSUE 출력에서 "dumpstate: Failed to parse"가 다량 출력될 경우
+#   연속 구간을 1줄로 축약하여 "(N)" 카운트로 표시
+#   예) dumpstate: Failed to parse (23)
+#   - ISSUE output에만 적용 (ALL output은 원문 유지)
 #
 # [Release Notes] v1.5.2
 # - (FEATURE) ISSUE 전용 키워드 처리 방식을 "체크박스 선택" 방식으로 변경
@@ -16,15 +22,10 @@
 # - (COMPAT) 기존 ui_state.json의 issue_only_keywords(리스트)도 자동 마이그레이션
 #
 # [Release Notes] v1.5.1
-# - (FIX) Run 후 UI 컨트롤이 disabled 상태로 남을 수 있는 문제 수정(_set_running 복구 로직 정정)
+# - (FIX) Run 후 UI 컨트롤이 disabled 상태로 남을 수 있는 문제 수정
 # - (UX) Window title에 Version/Last Updated 표기 추가
-# - (UX) Start/End Custom 입력값도 키 입력 즉시 UI state 저장하도록 개선
-# - (UX) 키워드 매칭 결과가 0인 경우 완료 시 알림 팝업으로 안내
-#
-# [Release Notes] v1.5.0
-# - (FEATURE) 로딩 블록 시작/완료 키워드: Preset 선택 + Custom 입력 지원
-# - (FEATURE) ISSUE 전용 키워드 리스트: 다중 추가/삭제 지원
-# - (FEATURE) ISSUE 출력에 ISSUE 전용 키워드 포함 여부 선택(Include/Exclude/Ignore)
+# - (UX) Start/End Custom 입력값도 키 입력 즉시 UI state 저장
+# - (UX) 키워드 매칭 결과가 0인 경우 완료 시 알림 팝업
 # ============================================================
 
 import os
@@ -36,8 +37,11 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-APP_VERSION = "v1.5.2"
+APP_VERSION = "v1.5.3"
 LAST_UPDATED = "2025-12-27"
+
+# ISSUE output에서 묶어서 카운트 표기할 대상(요청 반영)
+COLLAPSE_TARGET_SUBSTR = "dumpstate: Failed to parse"
 
 # =========================
 # UI state
@@ -73,12 +77,8 @@ DEFAULT_START = "LOADING_STARTED"
 DEFAULT_END = "onReceive(): action = LOADED"
 DEFAULT_ONPAGE = "onPageStarted()"
 
-START_PRESETS = [
-    DEFAULT_START,
-]
-END_PRESETS = [
-    DEFAULT_END,
-]
+START_PRESETS = [DEFAULT_START]
+END_PRESETS = [DEFAULT_END]
 
 LOGCAT_GLOB = "logcat_*_main.txt"
 
@@ -191,6 +191,42 @@ def block_contains_end(block: list[str], end_kw: str) -> bool:
     return any(end_kw in ln for ln in block)
 
 
+def collapse_repeated_substring_lines(lines: list[str], target_substr: str) -> list[str]:
+    """
+    ISSUE output용 후처리:
+    - lines 중 target_substr 포함 라인이 연속으로 여러 번 등장하면 1줄로 축약하여 "(N)" 표기.
+    - 연속이 끊기면 flush.
+    - 빈 줄("")도 연속 구간을 끊는 delimiter로 처리.
+    """
+    if not target_substr:
+        return lines
+
+    out: list[str] = []
+    cnt = 0
+
+    def flush():
+        nonlocal cnt
+        if cnt > 0:
+            out.append(f"{target_substr} ({cnt})")
+            cnt = 0
+
+    for ln in lines:
+        if ln == "":
+            flush()
+            out.append(ln)
+            continue
+
+        if target_substr in ln:
+            cnt += 1
+            continue
+
+        flush()
+        out.append(ln)
+
+    flush()
+    return out
+
+
 def block_extract_matches(
     block: list[str],
     all_keywords: list[str],
@@ -209,7 +245,7 @@ def block_extract_matches(
     """
     extra_keywords = [k for k in (extra_keywords or []) if k.strip()]
 
-    out = []
+    out: list[str] = []
     for ln in block:
         matched_all = any(k and (k in ln) for k in all_keywords)
         matched_extra = any(k in ln for k in extra_keywords) if extra_keywords else False
@@ -248,7 +284,7 @@ def process_logcat_file(
     blocks = extract_blocks(text, start_kw=start_kw)
 
     # ALL keywords 구성
-    all_keywords = []
+    all_keywords: list[str] = []
     if start_kw:
         all_keywords.append(start_kw)
     if include_onpage and DEFAULT_ONPAGE:
@@ -256,8 +292,8 @@ def process_logcat_file(
     if end_kw:
         all_keywords.append(end_kw)
 
-    all_out_blocks = []
-    issue_out_blocks = []
+    all_out_blocks: list[list[str]] = []
+    issue_out_blocks: list[list[str]] = []
 
     for b in blocks:
         # ALL (ISSUE 전용 키워드는 ALL에 넣지 않음)
@@ -278,8 +314,13 @@ def process_logcat_file(
                 all_keywords=all_keywords,
                 start_kw=start_kw,
                 end_kw=end_kw,
-                extra_keywords=issue_checked_keywords,  # 체크된 ISSUE 전용 키워드만 적용
+                extra_keywords=issue_checked_keywords,
             )
+
+            # v1.5.3: dumpstate 축약 카운트 (해당 키워드를 실제로 출력 대상으로 체크한 경우에만 의미가 있음)
+            if issue_matches and any(COLLAPSE_TARGET_SUBSTR in k for k in (issue_checked_keywords or [])):
+                issue_matches = collapse_repeated_substring_lines(issue_matches, COLLAPSE_TARGET_SUBSTR)
+
             if issue_matches:
                 issue_out_blocks.append(issue_matches)
 
@@ -297,16 +338,6 @@ def write_outputs(
     results: list[dict],
     cfg_summary_lines: list[str],
 ):
-    """
-    results item:
-      {
-        "section": Path,
-        "file": Path,
-        "all_blocks": list[list[str]],
-        "issue_blocks": list[list[str]],
-      }
-    """
-
     def write_header(f):
         f.write("========== CONFIG ==========\n")
         for ln in cfg_summary_lines:
@@ -376,10 +407,8 @@ class WebtimeApp(tk.Tk):
         self.use_custom_out_var = tk.BooleanVar(value=self.state_data.get("use_custom_out", False))
         self.out_path_var = tk.StringVar(value=self.state_data.get("out_path", ""))
 
-        # Tree/Indent
         self.path_format_var = tk.StringVar(value=self.state_data.get("path_format", "Tree"))
 
-        # Start/End keyword: preset + custom
         self.start_mode_var = tk.StringVar(value=self.state_data.get("start_mode", "Preset"))  # Preset/Custom
         self.end_mode_var = tk.StringVar(value=self.state_data.get("end_mode", "Preset"))      # Preset/Custom
         self.start_preset_var = tk.StringVar(value=self.state_data.get("start_preset", DEFAULT_START))
@@ -387,14 +416,10 @@ class WebtimeApp(tk.Tk):
         self.start_custom_var = tk.StringVar(value=self.state_data.get("start_custom", DEFAULT_START))
         self.end_custom_var = tk.StringVar(value=self.state_data.get("end_custom", DEFAULT_END))
 
-        # include onPageStarted in ALL extraction
         self.include_onpage_var = tk.BooleanVar(value=self.state_data.get("include_onpage", True))
 
-        # v1.5.2 ISSUE keywords: per-row checkbox + text
-        # state key: "issue_keywords": [{"enabled": true, "text": "PERCENTAGE_UPDATED"}, ...]
         issue_items = self._load_issue_keywords_items(self.state_data)
 
-        # Each item: {"enabled": BooleanVar, "text": StringVar}
         self.issue_items: list[dict] = []
         for it in issue_items:
             self.issue_items.append({
@@ -415,12 +440,6 @@ class WebtimeApp(tk.Tk):
 
     # ---------- state migration/load helpers ----------
     def _load_issue_keywords_items(self, state: dict) -> list[dict]:
-        """
-        v1.5.2 state format:
-          issue_keywords: [{"enabled": bool, "text": str}, ...]
-        backward compat:
-          issue_only_keywords: ["PERCENTAGE_UPDATED", ...]
-        """
         items = state.get("issue_keywords")
         if isinstance(items, list) and items:
             out = []
@@ -431,7 +450,6 @@ class WebtimeApp(tk.Tk):
                         out.append({"enabled": bool(x.get("enabled", True)), "text": txt})
             return out
 
-        # backward: v1.5.0~v1.5.1
         old = state.get("issue_only_keywords")
         if isinstance(old, list) and old:
             out = []
@@ -588,6 +606,11 @@ class WebtimeApp(tk.Tk):
             text="Checked keywords are additionally searched and printed ONLY in ISSUE output (blocks missing END)."
         ).pack(anchor="w")
 
+        ttk.Label(
+            isf,
+            text=f'Note: If "{COLLAPSE_TARGET_SUBSTR}" is checked, repeated lines will be collapsed as "(N)".'
+        ).pack(anchor="w", pady=(2, 0))
+
         self.issue_list_frame = ttk.Frame(isf)
         self.issue_list_frame.pack(fill=tk.X, pady=(8, 0))
         self._render_issue_rows()
@@ -679,7 +702,6 @@ class WebtimeApp(tk.Tk):
             "end_custom": self.end_custom_var.get(),
             "include_onpage": bool(self.include_onpage_var.get()),
 
-            # v1.5.2
             "issue_keywords": self._get_issue_keywords_state_dump(),
         }
 
@@ -741,13 +763,6 @@ class WebtimeApp(tk.Tk):
         for w in widgets:
             try:
                 w.configure(state="disabled" if running else "normal")
-            except Exception:
-                pass
-
-        # ISSUE list controls lock/unlock
-        for child in self.issue_list_frame.winfo_children():
-            try:
-                child.configure(state="disabled" if running else "normal")
             except Exception:
                 pass
 
@@ -835,7 +850,6 @@ class WebtimeApp(tk.Tk):
         self.out_label.configure(text=f"Output:\n- {out_all}\n- {out_issue}")
         self.log_write("== Done ==")
 
-        # v1.5.1 UX 유지: 매칭 0이면 알림
         try:
             total_all, total_issue = self._last_match_summary or (None, None)
             if total_all == 0 and total_issue == 0:
@@ -975,6 +989,7 @@ class WebtimeApp(tk.Tk):
             f"Block End Keyword  : {end_kw}",
             f'Include onPageStarted: {include_onpage} ({DEFAULT_ONPAGE})',
             f"Issue checked keywords: {issue_checked_keywords}",
+            f'Collapse in ISSUE: "{COLLAPSE_TARGET_SUBSTR}" -> "(N)" (if checked)',
         ]
 
         write_outputs(out_all, out_issue, path_lines_main, path_lines_ap, results, cfg_summary_lines)
